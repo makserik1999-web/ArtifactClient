@@ -1,5 +1,7 @@
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import HTMLResponse
+from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 from typing import List, Dict, Any, Optional
 import json
@@ -314,9 +316,374 @@ class SimilarityCalculator:
 # Initialize artifact database
 artifact_db = ArtifactDatabase()
 
-@app.get("/")
-async def root():
-    """Root endpoint with basic information"""
+# HTML template for the frontend
+HTML_TEMPLATE = """
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Artifact Identification System</title>
+    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.1.3/dist/css/bootstrap.min.css" rel="stylesheet">
+    <link href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0/css/all.min.css" rel="stylesheet">
+    <style>
+        body {
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            min-height: 100vh;
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+        }
+        .main-container {
+            background: white;
+            border-radius: 15px;
+            box-shadow: 0 10px 30px rgba(0,0,0,0.2);
+            margin: 2rem auto;
+            max-width: 1200px;
+        }
+        .header {
+            background: linear-gradient(45deg, #2c3e50, #34495e);
+            color: white;
+            padding: 2rem;
+            border-radius: 15px 15px 0 0;
+            text-align: center;
+        }
+        .form-section {
+            padding: 2rem;
+        }
+        .results-section {
+            padding: 2rem;
+            background: #f8f9fa;
+            border-radius: 0 0 15px 15px;
+            display: none;
+        }
+        .artifact-card {
+            background: white;
+            border-radius: 10px;
+            padding: 1.5rem;
+            margin-bottom: 1rem;
+            box-shadow: 0 4px 6px rgba(0,0,0,0.1);
+            border-left: 4px solid #007bff;
+        }
+        .confidence-bar {
+            height: 20px;
+            background: #e9ecef;
+            border-radius: 10px;
+            overflow: hidden;
+            margin: 0.5rem 0;
+        }
+        .confidence-fill {
+            height: 100%;
+            background: linear-gradient(45deg, #28a745, #20c997);
+            transition: width 0.5s ease;
+        }
+        .score-breakdown {
+            display: flex;
+            gap: 0.5rem;
+            margin: 1rem 0;
+            flex-wrap: wrap;
+        }
+        .score-badge {
+            padding: 0.25rem 0.75rem;
+            border-radius: 20px;
+            font-size: 0.85rem;
+            font-weight: 500;
+        }
+        .loading {
+            display: none;
+            text-align: center;
+            padding: 2rem;
+        }
+        .spinner {
+            animation: spin 1s linear infinite;
+        }
+        @keyframes spin {
+            0% { transform: rotate(0deg); }
+            100% { transform: rotate(360deg); }
+        }
+        .form-control:focus {
+            border-color: #667eea;
+            box-shadow: 0 0 0 0.2rem rgba(102, 126, 234, 0.25);
+        }
+        .btn-analyze {
+            background: linear-gradient(45deg, #667eea, #764ba2);
+            border: none;
+            padding: 0.75rem 2rem;
+            font-weight: 600;
+            text-transform: uppercase;
+            letter-spacing: 0.5px;
+        }
+        .btn-analyze:hover {
+            transform: translateY(-2px);
+            box-shadow: 0 4px 12px rgba(0,0,0,0.3);
+        }
+    </style>
+</head>
+<body>
+    <div class="container-fluid">
+        <div class="main-container">
+            <div class="header">
+                <h1><i class="fas fa-search"></i> Archaeological Artifact Identification</h1>
+                <p class="mb-0">Discover the history behind your archaeological finds using AI-powered similarity analysis</p>
+                <small class="text-light">Powered by advanced haversine distance calculations and multi-factor scoring</small>
+            </div>
+            
+            <div class="form-section">
+                <form id="artifactForm">
+                    <div class="row">
+                        <div class="col-md-4">
+                            <h5><i class="fas fa-ruler-combined text-primary"></i> Physical Dimensions (cm)</h5>
+                            <div class="mb-3">
+                                <label for="length" class="form-label">Length</label>
+                                <input type="number" class="form-control" id="length" step="0.1" min="0.1" required>
+                            </div>
+                            <div class="mb-3">
+                                <label for="width" class="form-label">Width</label>
+                                <input type="number" class="form-control" id="width" step="0.1" min="0.1" required>
+                            </div>
+                            <div class="mb-3">
+                                <label for="height" class="form-label">Height</label>
+                                <input type="number" class="form-control" id="height" step="0.1" min="0.1" required>
+                            </div>
+                        </div>
+                        
+                        <div class="col-md-4">
+                            <h5><i class="fas fa-palette text-warning"></i> Physical Properties</h5>
+                            <div class="mb-3">
+                                <label for="color" class="form-label">Color</label>
+                                <input type="text" class="form-control" id="color" placeholder="e.g., brown, #a0522d" required>
+                                <small class="form-text text-muted">Color name or hex code</small>
+                            </div>
+                            <div class="mb-3">
+                                <label for="material" class="form-label">Material</label>
+                                <select class="form-control" id="material" required>
+                                    <option value="">Select material...</option>
+                                    <option value="clay">Clay/Ceramic</option>
+                                    <option value="stone">Stone</option>
+                                    <option value="metal">Metal</option>
+                                    <option value="bronze">Bronze</option>
+                                    <option value="iron">Iron</option>
+                                    <option value="gold">Gold</option>
+                                    <option value="jade">Jade</option>
+                                    <option value="flint">Flint</option>
+                                    <option value="bone">Bone</option>
+                                </select>
+                            </div>
+                            <div class="mb-3">
+                                <label for="shape" class="form-label">Shape</label>
+                                <select class="form-control" id="shape" required>
+                                    <option value="">Select shape...</option>
+                                    <option value="oval">Oval</option>
+                                    <option value="rectangular">Rectangular</option>
+                                    <option value="cylindrical">Cylindrical</option>
+                                    <option value="triangular">Triangular</option>
+                                    <option value="circular">Circular</option>
+                                    <option value="crescent">Crescent</option>
+                                </select>
+                            </div>
+                        </div>
+                        
+                        <div class="col-md-4">
+                            <h5><i class="fas fa-map-marker-alt text-success"></i> Discovery Location</h5>
+                            <div class="mb-3">
+                                <label for="latitude" class="form-label">Latitude</label>
+                                <input type="number" class="form-control" id="latitude" step="0.0001" min="-90" max="90" required>
+                                <small class="form-text text-muted">-90 to 90 degrees</small>
+                            </div>
+                            <div class="mb-3">
+                                <label for="longitude" class="form-label">Longitude</label>
+                                <input type="number" class="form-control" id="longitude" step="0.0001" min="-180" max="180" required>
+                                <small class="form-text text-muted">-180 to 180 degrees</small>
+                            </div>
+                            <div class="mt-4">
+                                <button type="submit" class="btn btn-primary btn-analyze w-100">
+                                    <i class="fas fa-search"></i> Analyze Artifact
+                                </button>
+                            </div>
+                        </div>
+                    </div>
+                </form>
+                
+                <div class="loading" id="loading">
+                    <i class="fas fa-spinner spinner fa-3x text-primary"></i>
+                    <p class="mt-3">Analyzing your artifact using AI similarity matching...</p>
+                </div>
+            </div>
+            
+            <div class="results-section" id="results">
+                <h4><i class="fas fa-trophy text-warning"></i> Analysis Results</h4>
+                <div id="resultsContent"></div>
+                
+                <div class="mt-4">
+                    <a href="/docs" class="btn btn-outline-secondary">
+                        <i class="fas fa-code"></i> API Documentation
+                    </a>
+                    <button class="btn btn-outline-primary ms-2" onclick="resetForm()">
+                        <i class="fas fa-redo"></i> Analyze Another
+                    </button>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        document.getElementById('artifactForm').addEventListener('submit', async function(e) {
+            e.preventDefault();
+            
+            // Show loading state
+            document.getElementById('loading').style.display = 'block';
+            document.getElementById('results').style.display = 'none';
+            
+            // Collect form data
+            const formData = {
+                length: parseFloat(document.getElementById('length').value),
+                width: parseFloat(document.getElementById('width').value),
+                height: parseFloat(document.getElementById('height').value),
+                color: document.getElementById('color').value,
+                material: document.getElementById('material').value,
+                shape: document.getElementById('shape').value,
+                latitude: parseFloat(document.getElementById('latitude').value),
+                longitude: parseFloat(document.getElementById('longitude').value)
+            };
+            
+            try {
+                const response = await fetch('/analyze', {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json',
+                    },
+                    body: JSON.stringify(formData)
+                });
+                
+                if (!response.ok) {
+                    throw new Error(`HTTP error! status: ${response.status}`);
+                }
+                
+                const result = await response.json();
+                displayResults(result);
+                
+            } catch (error) {
+                console.error('Error:', error);
+                document.getElementById('resultsContent').innerHTML = `
+                    <div class="alert alert-danger">
+                        <i class="fas fa-exclamation-triangle"></i>
+                        Error analyzing artifact: ${error.message}
+                    </div>
+                `;
+                document.getElementById('results').style.display = 'block';
+            } finally {
+                document.getElementById('loading').style.display = 'none';
+            }
+        });
+        
+        function displayResults(data) {
+            const resultsContent = document.getElementById('resultsContent');
+            
+            let html = `
+                <div class="artifact-card">
+                    <div class="row">
+                        <div class="col-md-8">
+                            <h5><i class="fas fa-crown text-warning"></i> Best Match</h5>
+                            <h3 class="text-primary">${data.result.artifact}</h3>
+                            <p class="text-muted mb-2"><i class="fas fa-history"></i> ${data.result.era}</p>
+                            <p class="mb-3">${data.result.reason}</p>
+                            
+                            <div class="confidence-bar">
+                                <div class="confidence-fill" style="width: ${data.result.confidence}%"></div>
+                            </div>
+                            <small class="text-muted">Confidence: ${data.result.confidence}%</small>
+                            
+                            <div class="score-breakdown">
+                                <span class="badge score-badge bg-primary">Size: ${data.result.scores.size.toFixed(1)}</span>
+                                <span class="badge score-badge bg-info">Color: ${data.result.scores.color.toFixed(1)}</span>
+                                <span class="badge score-badge bg-success">Material: ${data.result.scores.material.toFixed(1)}</span>
+                                <span class="badge score-badge bg-warning">Shape: ${data.result.scores.shape.toFixed(1)}</span>
+                                <span class="badge score-badge bg-secondary">Location: ${data.result.scores.location.toFixed(1)}</span>
+                            </div>
+                        </div>
+                        <div class="col-md-4 text-center">
+                            <div class="bg-light rounded p-3">
+                                <i class="fas fa-image fa-4x text-muted mb-2"></i>
+                                <p class="small text-muted">Artifact visualization not available</p>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            `;
+            
+            if (data.top_candidates && data.top_candidates.length > 1) {
+                html += `
+                    <h5 class="mt-4"><i class="fas fa-list"></i> Alternative Matches</h5>
+                `;
+                
+                data.top_candidates.slice(1).forEach((candidate, index) => {
+                    html += `
+                        <div class="artifact-card">
+                            <div class="row align-items-center">
+                                <div class="col-md-8">
+                                    <h6>${candidate.artifact}</h6>
+                                    <small class="text-muted">${candidate.era}</small>
+                                    <div class="confidence-bar mt-2" style="height: 10px;">
+                                        <div class="confidence-fill" style="width: ${candidate.confidence}%; background: #6c757d;"></div>
+                                    </div>
+                                </div>
+                                <div class="col-md-4 text-end">
+                                    <span class="badge bg-secondary">${candidate.confidence.toFixed(1)}%</span>
+                                </div>
+                            </div>
+                        </div>
+                    `;
+                });
+            }
+            
+            resultsContent.innerHTML = html;
+            document.getElementById('results').style.display = 'block';
+            
+            // Smooth scroll to results
+            document.getElementById('results').scrollIntoView({ 
+                behavior: 'smooth' 
+            });
+        }
+        
+        function resetForm() {
+            document.getElementById('artifactForm').reset();
+            document.getElementById('results').style.display = 'none';
+            document.getElementById('loading').style.display = 'none';
+        }
+        
+        // Example data population for demo
+        function loadExample() {
+            document.getElementById('length').value = '12.5';
+            document.getElementById('width').value = '7.8';
+            document.getElementById('height').value = '3.2';
+            document.getElementById('color').value = 'brown';
+            document.getElementById('material').value = 'clay';
+            document.getElementById('shape').value = 'oval';
+            document.getElementById('latitude').value = '41.9028';
+            document.getElementById('longitude').value = '12.4964';
+        }
+        
+        // Add example button after page load
+        window.addEventListener('load', function() {
+            const exampleBtn = document.createElement('button');
+            exampleBtn.className = 'btn btn-outline-info btn-sm ms-2';
+            exampleBtn.innerHTML = '<i class="fas fa-magic"></i> Load Example';
+            exampleBtn.onclick = loadExample;
+            
+            const analyzeBtn = document.querySelector('.btn-analyze');
+            analyzeBtn.parentNode.appendChild(exampleBtn);
+        });
+    </script>
+</body>
+</html>
+"""
+
+@app.get("/", response_class=HTMLResponse)
+async def get_homepage():
+    """Serve the HTML frontend interface"""
+    return HTML_TEMPLATE
+
+@app.get("/api")
+async def api_info():
+    """API information endpoint (alternative to old root)"""
     return {
         "message": "Artifact Identification System",
         "version": "2.0.0",
