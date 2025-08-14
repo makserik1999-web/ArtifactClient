@@ -1,0 +1,99 @@
+You are working on an existing FastAPI project for artifact identification. The repo already has:
+- main.py (FastAPI app with POST /analyze)
+- artifacts.json (reference dataset)
+- pyproject.toml / .replit
+
+Refactor and enhance the code with the following requirements, without breaking the current API contract (POST /analyze remains) and keeping backward compatibility (still return the single best match as before), while adding richer output.
+
+FUNCTIONAL CHANGES
+1) Haversine location scoring (in kilometers):
+   - Implement a haversine(lat1, lon1, lat2, lon2) helper.
+   - Convert location similarity into a 0–10 score using thresholds:
+     - distance < 10 km  -> 10 points
+     - distance < 50 km  -> 6 points
+     - distance < 150 km -> 3 points
+     - else              -> 0 points
+
+2) Explainability (component scores):
+   - For each candidate, compute and expose component scores:
+     size_score (0–30), color_score (0–20), material_score (0–20), shape_score (0–20), location_score (0–10).
+   - total_score = sum of component scores.
+   - confidence = round(total_score, 1)  // keep as percentage 0–100 like before.
+
+3) Top-3 candidates:
+   - Return the top 3 candidates sorted by total_score desc.
+   - Response must include BOTH:
+     a) "result": the single best match (for backward compatibility),
+     b) "top_candidates": an array of up to 3 candidates with fields:
+        {
+          "artifact": <name>,
+          "era": <era>,
+          "scores": {
+            "size": <number>,
+            "color": <number>,
+            "material": <number>,
+            "shape": <number>,
+            "location": <number>
+          },
+          "total_score": <number>,
+          "confidence": <number>,
+          "reason": <short string>
+        }
+
+4) Input normalization:
+   - For string fields (color, material, shape): trim and lowercase.
+   - Accept color as either a human name (e.g., "brown") or hex ("#a0522d"). Map common hexes to basic names where possible (fallback to raw).
+   - Add simple synonym mapping:
+     material: { "ceramic": "ceramics", "clay": "ceramics", "stone": "stone", "metal": "metal", "bone": "bone" }
+     shape:    map common variants like "with handle" -> "handle", "sharp edge" -> "sharp", etc.
+   - Keep mappings small and readable within the code.
+
+5) Configurable weights:
+   - Introduce WEIGHTS = {"size": 30, "color": 20, "material": 20, "shape": 20, "location": 10}.
+   - Use these weights to compute component scores.
+   - Allow overriding via environment variable ARTIFACT_WEIGHTS as JSON (e.g., {"size":25,...}). Validate and fallback to defaults on errors.
+
+6) Validation and error handling:
+   - Pydantic model constraints:
+     length/width/height: > 0
+     latitude in [-90, 90], longitude in [-180, 180]
+   - If artifacts.json is missing, unreadable, or empty -> raise HTTP 500 with message "Reference DB not loaded".
+   - Keep FastAPI’s 422 for validation errors but add clear error messages (Field(..., description="...")).
+
+7) CORS:
+   - Enable CORS for development: allow all origins, methods, and headers (configurable in code).
+
+SCORING DETAILS
+- Size similarity: distribute up to WEIGHTS["size"] points by penalizing absolute differences across (length, width, height). Keep simple and deterministic.
+- Color/material/shape: exact match (after normalization) yields full weight; near-match or synonym yields full weight; otherwise 0. Keep the logic readable and explain in comments.
+- Location: use the haversine thresholds above for WEIGHTS["location"].
+
+RESPONSE FORMAT (example)
+Return JSON:
+{
+  "result": {
+    "artifact": "Ceramic jug",
+    "era": "Medieval",
+    "confidence": 87.0,
+    "scores": { "size": 28, "color": 20, "material": 20, "shape": 12, "location": 7 },
+    "total_score": 87,
+    "reason": "High similarity in size, color, and material; plausible location match."
+  },
+  "top_candidates": [
+    { ...best candidate as above... },
+    { ...second best... },
+    { ...third best... }
+  ]
+}
+
+NON-FUNCTIONAL
+- Keep code clean and commented, with short docstrings for new helpers.
+- Do not remove existing endpoint paths.
+- Keep artifacts.json format unchanged.
+- Add a small inline test/example in README/replit.md showing a sample POST body and a truncated sample response.
+
+DELIVERABLES
+- Updated main.py with the new scoring, explainability, top-3 output, normalization, weights, CORS, and validations.
+- No breaking changes to the existing API route (/analyze).
+
+Now implement the changes in main.py accordingly.

@@ -1,6 +1,7 @@
 from fastapi import FastAPI, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Optional
 import json
 import math
 import os
@@ -9,22 +10,101 @@ from pathlib import Path
 app = FastAPI(
     title="Artifact Identification System",
     description="A FastAPI-based system for identifying archaeological artifacts using similarity scoring",
-    version="1.0.0"
+    version="2.0.0"
 )
+
+# Enable CORS for development
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],  # Configure appropriately for production
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# Configurable weights for scoring components
+DEFAULT_WEIGHTS = {"size": 30, "color": 20, "material": 20, "shape": 20, "location": 10}
+
+def load_weights() -> Dict[str, int]:
+    """Load scoring weights from environment variable or use defaults"""
+    try:
+        weights_str = os.getenv("ARTIFACT_WEIGHTS")
+        if weights_str:
+            weights = json.loads(weights_str)
+            # Validate weights
+            if isinstance(weights, dict) and all(isinstance(v, (int, float)) for v in weights.values()):
+                return {**DEFAULT_WEIGHTS, **weights}
+    except (json.JSONDecodeError, TypeError):
+        pass
+    return DEFAULT_WEIGHTS.copy()
+
+WEIGHTS = load_weights()
+
+# Normalization mappings
+MATERIAL_SYNONYMS = {
+    "ceramic": "ceramics",
+    "clay": "ceramics",
+    "stone": "stone", 
+    "metal": "metal",
+    "bone": "bone"
+}
+
+SHAPE_SYNONYMS = {
+    "with handle": "handle",
+    "sharp edge": "sharp",
+    "rounded": "round",
+    "elongated": "oval"
+}
+
+# Common hex to color name mappings
+HEX_TO_COLOR = {
+    "#a0522d": "brown",
+    "#8b4513": "brown",
+    "#d2691e": "orange",
+    "#ffd700": "gold",
+    "#c0c0c0": "silver",
+    "#808080": "grey",
+    "#000000": "black",
+    "#ffffff": "white",
+    "#ff0000": "red",
+    "#00ff00": "green",
+    "#0000ff": "blue"
+}
+
+def normalize_string_field(value: str, synonyms: Optional[Dict[str, str]] = None) -> str:
+    """Normalize string fields: trim, lowercase, apply synonyms"""
+    normalized = value.strip().lower()
+    if synonyms and normalized in synonyms:
+        return synonyms[normalized]
+    return normalized
+
+def normalize_color(color: str) -> str:
+    """Normalize color: handle hex codes and synonyms"""
+    color = color.strip().lower()
+    # Check if it's a hex code
+    if color.startswith('#') and len(color) == 7:
+        return HEX_TO_COLOR.get(color, color)
+    return color
 
 class ArtifactInput(BaseModel):
     """Input model for artifact analysis requests"""
-    length: float = Field(..., description="Length in cm", gt=0)
-    width: float = Field(..., description="Width in cm", gt=0)
-    height: float = Field(..., description="Height in cm", gt=0)
-    color: str = Field(..., description="Color (lowercase)")
-    material: str = Field(..., description="Material (lowercase)")
-    shape: str = Field(..., description="Shape (lowercase)")
-    latitude: float = Field(..., description="Latitude coordinate", ge=-90, le=90)
-    longitude: float = Field(..., description="Longitude coordinate", ge=-180, le=180)
+    length: float = Field(..., description="Length in cm (must be > 0)", gt=0)
+    width: float = Field(..., description="Width in cm (must be > 0)", gt=0)
+    height: float = Field(..., description="Height in cm (must be > 0)", gt=0)
+    color: str = Field(..., description="Color name or hex code (e.g., 'brown' or '#a0522d')")
+    material: str = Field(..., description="Material type (e.g., 'clay', 'stone', 'metal')")
+    shape: str = Field(..., description="Shape description (e.g., 'oval', 'rectangular')")
+    latitude: float = Field(..., description="Latitude coordinate (must be between -90 and 90)", ge=-90, le=90)
+    longitude: float = Field(..., description="Longitude coordinate (must be between -180 and 180)", ge=-180, le=180)
+
+    def normalize_fields(self):
+        """Apply normalization to string fields"""
+        self.color = normalize_color(self.color)
+        self.material = normalize_string_field(self.material, MATERIAL_SYNONYMS)
+        self.shape = normalize_string_field(self.shape, SHAPE_SYNONYMS)
 
     class Config:
-        schema_extra = {
+        json_schema_extra = {
             "example": {
                 "length": 15.5,
                 "width": 8.2,
@@ -37,12 +117,27 @@ class ArtifactInput(BaseModel):
             }
         }
 
-class ArtifactResponse(BaseModel):
-    """Response model for artifact identification results"""
-    artifact: str = Field(..., description="Name of the identified artifact")
+class ComponentScores(BaseModel):
+    """Component scores for similarity analysis"""
+    size: float = Field(..., description="Size similarity score (0-30)")
+    color: float = Field(..., description="Color match score (0-20)")
+    material: float = Field(..., description="Material match score (0-20)")
+    shape: float = Field(..., description="Shape match score (0-20)")
+    location: float = Field(..., description="Location proximity score (0-10)")
+
+class CandidateResult(BaseModel):
+    """Individual candidate result with detailed scoring"""
+    artifact: str = Field(..., description="Name of the artifact")
     era: str = Field(..., description="Historical era of the artifact")
+    scores: ComponentScores = Field(..., description="Detailed component scores")
+    total_score: float = Field(..., description="Total similarity score")
     confidence: float = Field(..., description="Confidence percentage (0-100)")
     reason: str = Field(..., description="Short explanation of the match")
+
+class ArtifactResponse(BaseModel):
+    """Enhanced response model with backward compatibility and top candidates"""
+    result: CandidateResult = Field(..., description="Best matching artifact (for backward compatibility)")
+    top_candidates: List[CandidateResult] = Field(..., description="Top 3 candidate matches")
 
 class ArtifactDatabase:
     """Class to handle artifact reference data loading and management"""
@@ -56,50 +151,61 @@ class ArtifactDatabase:
         """Load artifact reference data from JSON file"""
         try:
             if not Path(self.json_file_path).exists():
-                raise FileNotFoundError(f"Artifacts file {self.json_file_path} not found")
+                raise HTTPException(status_code=500, detail="Reference DB not loaded")
             
             with open(self.json_file_path, 'r', encoding='utf-8') as file:
                 data = json.load(file)
                 
             if not isinstance(data, list):
-                raise ValueError("Artifacts JSON must contain a list of artifacts")
+                raise HTTPException(status_code=500, detail="Reference DB not loaded")
             
             if len(data) == 0:
-                raise ValueError("Artifacts JSON file is empty")
+                raise HTTPException(status_code=500, detail="Reference DB not loaded")
             
             # Validate required fields for each artifact
             required_fields = ['name', 'era', 'length', 'width', 'height', 'color', 'material', 'shape', 'latitude', 'longitude']
             for i, artifact in enumerate(data):
                 missing_fields = [field for field in required_fields if field not in artifact]
                 if missing_fields:
-                    raise ValueError(f"Artifact {i} missing required fields: {missing_fields}")
+                    raise HTTPException(status_code=500, detail="Reference DB not loaded")
             
             self.artifacts = data
             print(f"Successfully loaded {len(self.artifacts)} artifacts from {self.json_file_path}")
             
-        except FileNotFoundError as e:
-            print(f"Error: {e}")
-            raise HTTPException(status_code=500, detail=f"Artifact reference file not found: {self.json_file_path}")
-        except json.JSONDecodeError as e:
-            print(f"Error parsing JSON: {e}")
-            raise HTTPException(status_code=500, detail="Invalid JSON format in artifacts file")
-        except ValueError as e:
-            print(f"Error: {e}")
-            raise HTTPException(status_code=500, detail=str(e))
-        except Exception as e:
-            print(f"Unexpected error loading artifacts: {e}")
-            raise HTTPException(status_code=500, detail="Failed to load artifact reference data")
+        except HTTPException:
+            raise
+        except (FileNotFoundError, json.JSONDecodeError, ValueError, Exception) as e:
+            print(f"Error loading artifacts: {e}")
+            raise HTTPException(status_code=500, detail="Reference DB not loaded")
+
+def haversine(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
+    """
+    Calculate the great circle distance between two points on Earth in kilometers
+    """
+    # Convert decimal degrees to radians
+    lat1_rad, lon1_rad, lat2_rad, lon2_rad = map(math.radians, [lat1, lon1, lat2, lon2])
+    
+    # Haversine formula
+    dlat = lat2_rad - lat1_rad
+    dlon = lon2_rad - lon1_rad
+    a = math.sin(dlat/2)**2 + math.cos(lat1_rad) * math.cos(lat2_rad) * math.sin(dlon/2)**2
+    c = 2 * math.asin(math.sqrt(a))
+    
+    # Radius of Earth in kilometers
+    r = 6371
+    
+    return c * r
 
 class SimilarityCalculator:
-    """Class to handle similarity scoring calculations"""
+    """Enhanced similarity scoring with configurable weights and haversine distance"""
     
     @staticmethod
     def calculate_size_similarity(input_artifact: ArtifactInput, reference_artifact: Dict[str, Any]) -> float:
         """
-        Calculate size similarity score (max 30 points)
-        Subtracts absolute differences in dimensions from maximum score
+        Calculate size similarity score using configurable weights
+        Distributes points by penalizing absolute differences across dimensions
         """
-        max_points = 30.0
+        max_points = WEIGHTS["size"]
         
         # Calculate absolute differences for each dimension
         length_diff = abs(input_artifact.length - reference_artifact['length'])
@@ -115,38 +221,59 @@ class SimilarityCalculator:
         return score
     
     @staticmethod
-    def calculate_exact_match_score(input_value: str, reference_value: str, points: float = 20.0) -> float:
+    def calculate_exact_match_score(input_value: str, reference_value: str, attribute_type: str) -> float:
         """
-        Calculate exact match score for categorical attributes
-        Returns full points for exact match, 0 otherwise
+        Calculate exact match score for categorical attributes with normalization
+        Returns full weight for exact match after normalization, 0 otherwise
         """
-        return points if input_value.lower().strip() == str(reference_value).lower().strip() else 0.0
+        max_points = WEIGHTS[attribute_type]
+        
+        # Normalize both values for comparison
+        if attribute_type == "color":
+            input_normalized = normalize_color(input_value)
+            ref_normalized = normalize_color(str(reference_value))
+        elif attribute_type == "material":
+            input_normalized = normalize_string_field(input_value, MATERIAL_SYNONYMS)
+            ref_normalized = normalize_string_field(str(reference_value), MATERIAL_SYNONYMS)
+        elif attribute_type == "shape":
+            input_normalized = normalize_string_field(input_value, SHAPE_SYNONYMS)
+            ref_normalized = normalize_string_field(str(reference_value), SHAPE_SYNONYMS)
+        else:
+            input_normalized = input_value.lower().strip()
+            ref_normalized = str(reference_value).lower().strip()
+        
+        return max_points if input_normalized == ref_normalized else 0.0
     
     @staticmethod
     def calculate_location_similarity(input_artifact: ArtifactInput, reference_artifact: Dict[str, Any]) -> float:
         """
-        Calculate location similarity score (max 10 points)
-        Returns 10 points if coordinates are within 1 degree, 0 otherwise
+        Calculate location similarity score using haversine distance in kilometers
+        Threshold-based scoring: <10km=10pts, <50km=6pts, <150km=3pts, else=0pts
         """
-        lat_diff = abs(input_artifact.latitude - reference_artifact['latitude'])
-        lon_diff = abs(input_artifact.longitude - reference_artifact['longitude'])
+        distance_km = haversine(
+            input_artifact.latitude, input_artifact.longitude,
+            reference_artifact['latitude'], reference_artifact['longitude']
+        )
         
-        # Check if both latitude and longitude are within 1 degree
-        if lat_diff <= 1.0 and lon_diff <= 1.0:
+        if distance_km < 10:
             return 10.0
+        elif distance_km < 50:
+            return 6.0
+        elif distance_km < 150:
+            return 3.0
         else:
             return 0.0
     
     @staticmethod
     def calculate_total_similarity(input_artifact: ArtifactInput, reference_artifact: Dict[str, Any]) -> Dict[str, Any]:
         """
-        Calculate total similarity score and generate reasoning
+        Calculate total similarity score with detailed component breakdown
         """
-        # Calculate individual scores
+        # Calculate individual component scores
         size_score = SimilarityCalculator.calculate_size_similarity(input_artifact, reference_artifact)
-        color_score = SimilarityCalculator.calculate_exact_match_score(input_artifact.color, reference_artifact['color'])
-        material_score = SimilarityCalculator.calculate_exact_match_score(input_artifact.material, reference_artifact['material'])
-        shape_score = SimilarityCalculator.calculate_exact_match_score(input_artifact.shape, reference_artifact['shape'])
+        color_score = SimilarityCalculator.calculate_exact_match_score(input_artifact.color, reference_artifact['color'], "color")
+        material_score = SimilarityCalculator.calculate_exact_match_score(input_artifact.material, reference_artifact['material'], "material")
+        shape_score = SimilarityCalculator.calculate_exact_match_score(input_artifact.shape, reference_artifact['shape'], "shape")
         location_score = SimilarityCalculator.calculate_location_similarity(input_artifact, reference_artifact)
         
         # Calculate total score
@@ -161,8 +288,12 @@ class SimilarityCalculator:
         if shape_score > 0:
             reasons.append(f"shape match ({reference_artifact['shape']})")
         if location_score > 0:
-            reasons.append("location proximity")
-        if size_score > 20:  # Good size similarity
+            distance_km = haversine(
+                input_artifact.latitude, input_artifact.longitude,
+                reference_artifact['latitude'], reference_artifact['longitude']
+            )
+            reasons.append(f"location proximity ({distance_km:.1f}km)")
+        if size_score > WEIGHTS["size"] * 0.7:  # Good size similarity (>70% of max)
             reasons.append("similar dimensions")
         
         if not reasons:
@@ -188,12 +319,13 @@ async def root():
     """Root endpoint with basic information"""
     return {
         "message": "Artifact Identification System",
-        "version": "1.0.0",
+        "version": "2.0.0",
         "endpoints": {
             "analyze": "/analyze (POST)",
             "docs": "/docs",
             "artifacts_count": len(artifact_db.artifacts)
-        }
+        },
+        "weights": WEIGHTS
     }
 
 @app.get("/artifacts")
@@ -207,46 +339,62 @@ async def get_artifacts():
 @app.post("/analyze", response_model=ArtifactResponse)
 async def analyze_artifact(artifact_input: ArtifactInput):
     """
-    Analyze an artifact and return the most similar match from the reference database
+    Analyze an artifact and return the most similar matches from the reference database
     
-    The similarity scoring system uses:
-    - Size similarity: max 30 points (subtracts dimensional differences)
-    - Color match: 20 points for exact match
-    - Material match: 20 points for exact match  
-    - Shape match: 20 points for exact match
-    - Location similarity: 10 points if within 1 degree
+    The enhanced similarity scoring system uses configurable weights:
+    - Size similarity: penalizes dimensional differences (default: 30 points max)
+    - Color match: exact match after normalization (default: 20 points)
+    - Material match: exact match with synonyms (default: 20 points)  
+    - Shape match: exact match with synonyms (default: 20 points)
+    - Location similarity: haversine distance thresholds (default: 10 points)
     
-    Total possible score: 100 points
+    Returns both the best match (for backward compatibility) and top 3 candidates.
     """
     try:
         if not artifact_db.artifacts:
-            raise HTTPException(status_code=500, detail="No reference artifacts available")
+            raise HTTPException(status_code=500, detail="Reference DB not loaded")
         
-        best_match = None
-        best_score = -1
-        best_details = None
+        # Apply input normalization
+        artifact_input.normalize_fields()
+        
+        candidates = []
         
         # Calculate similarity for each reference artifact
         for reference_artifact in artifact_db.artifacts:
             similarity_details = SimilarityCalculator.calculate_total_similarity(artifact_input, reference_artifact)
             
-            if similarity_details['total_score'] > best_score:
-                best_score = similarity_details['total_score']
-                best_match = reference_artifact
-                best_details = similarity_details
+            # Calculate confidence as rounded total score (already 0-100 scale)
+            confidence = round(similarity_details['total_score'], 1)
+            
+            candidate = CandidateResult(
+                artifact=reference_artifact['name'],
+                era=reference_artifact['era'],
+                scores=ComponentScores(
+                    size=similarity_details['size_score'],
+                    color=similarity_details['color_score'],
+                    material=similarity_details['material_score'],
+                    shape=similarity_details['shape_score'],
+                    location=similarity_details['location_score']
+                ),
+                total_score=similarity_details['total_score'],
+                confidence=confidence,
+                reason=similarity_details['reason']
+            )
+            candidates.append(candidate)
         
-        if best_match is None:
+        if not candidates:
             raise HTTPException(status_code=500, detail="No suitable match found")
         
-        # Calculate confidence as percentage of maximum possible score (100)
-        confidence = (best_score / 100.0) * 100.0
-        confidence = round(confidence, 2)
+        # Sort candidates by total score (descending) and take top 3
+        candidates.sort(key=lambda x: x.total_score, reverse=True)
+        top_candidates = candidates[:3]
+        
+        # Best match is the first candidate (for backward compatibility)
+        best_match = top_candidates[0]
         
         return ArtifactResponse(
-            artifact=best_match['name'],
-            era=best_match['era'],
-            confidence=confidence,
-            reason=best_details['reason']
+            result=best_match,
+            top_candidates=top_candidates
         )
         
     except HTTPException:
@@ -261,6 +409,7 @@ async def health_check():
     return {
         "status": "healthy",
         "artifacts_loaded": len(artifact_db.artifacts),
+        "weights": WEIGHTS,
         "timestamp": "2025-08-14"
     }
 
@@ -271,9 +420,10 @@ if __name__ == "__main__":
     if not Path("artifacts.json").exists():
         print("Warning: artifacts.json not found. Server will fail to load artifacts.")
     
-    print("Starting Artifact Identification System...")
+    print("Starting Enhanced Artifact Identification System...")
     print("Server will be available at: http://0.0.0.0:8000")
     print("API documentation: http://0.0.0.0:8000/docs")
+    print(f"Using weights: {WEIGHTS}")
     
     uvicorn.run(
         "main:app",
