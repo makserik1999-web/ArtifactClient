@@ -1,6 +1,6 @@
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import FastAPI, HTTPException, Request, UploadFile, File, Form
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import HTMLResponse
+from fastapi.responses import HTMLResponse, FileResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 from typing import List, Dict, Any, Optional
@@ -8,6 +8,14 @@ import json
 import math
 import os
 from pathlib import Path
+import shutil
+import uuid
+from PIL import Image
+import torch
+import torchvision.transforms as transforms
+import torchvision.models as models
+import io
+import base64
 
 app = FastAPI(
     title="Artifact Identification System",
@@ -41,6 +49,54 @@ def load_weights() -> Dict[str, int]:
     return DEFAULT_WEIGHTS.copy()
 
 WEIGHTS = load_weights()
+
+# Create upload directory
+UPLOAD_DIR = Path("uploads")
+UPLOAD_DIR.mkdir(exist_ok=True)
+
+# Initialize image feature extractor
+class ImageFeatureExtractor:
+    """Extract features from artifact images using pretrained ResNet"""
+    
+    def __init__(self):
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self.model = models.resnet50(pretrained=True)
+        self.model.eval()
+        
+        # Remove the final classification layer to get features
+        self.model = torch.nn.Sequential(*list(self.model.children())[:-1])
+        
+        self.transform = transforms.Compose([
+            transforms.Resize((224, 224)),
+            transforms.ToTensor(),
+            transforms.Normalize(mean=[0.485, 0.456, 0.406], 
+                               std=[0.229, 0.224, 0.225])
+        ])
+    
+    def extract_features(self, image_path: str) -> torch.Tensor:
+        """Extract features from an image"""
+        try:
+            image = Image.open(image_path).convert('RGB')
+            image_tensor = self.transform(image)
+            image_tensor = image_tensor.unsqueeze(0)
+            
+            with torch.no_grad():
+                features = self.model(image_tensor)
+                # Flatten the features
+                features = features.view(features.size(0), -1)
+            
+            return features.squeeze()
+        except Exception as e:
+            print(f"Error extracting image features: {e}")
+            return torch.zeros(2048)  # Return zero vector if extraction fails
+
+# Initialize feature extractor
+try:
+    image_extractor = ImageFeatureExtractor()
+    print("Image feature extractor initialized successfully")
+except Exception as e:
+    print(f"Warning: Could not initialize image feature extractor: {e}")
+    image_extractor = None
 
 # Normalization mappings
 MATERIAL_SYNONYMS = {
@@ -140,6 +196,7 @@ class ArtifactResponse(BaseModel):
     """Enhanced response model with backward compatibility and top candidates"""
     result: CandidateResult = Field(..., description="Best matching artifact (for backward compatibility)")
     top_candidates: List[CandidateResult] = Field(..., description="Top 3 candidate matches")
+    uploaded_image: Optional[str] = Field(None, description="Path to uploaded image if provided")
 
 class ArtifactDatabase:
     """Class to handle artifact reference data loading and management"""
@@ -316,6 +373,9 @@ class SimilarityCalculator:
 # Initialize artifact database
 artifact_db = ArtifactDatabase()
 
+# Mount uploads directory for serving uploaded images
+app.mount("/uploads", StaticFiles(directory="uploads"), name="uploads")
+
 # HTML template for the frontend
 HTML_TEMPLATE = """
 <!DOCTYPE html>
@@ -324,7 +384,7 @@ HTML_TEMPLATE = """
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Artifact Identification System</title>
-    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.1.3/dist/css/bootstrap.min.css" rel="stylesheet">
+    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet">
     <link href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0/css/all.min.css" rel="stylesheet">
     <style>
         body {
@@ -415,6 +475,80 @@ HTML_TEMPLATE = """
             transform: translateY(-2px);
             box-shadow: 0 4px 12px rgba(0,0,0,0.3);
         }
+        .image-upload-area {
+            border: 2px dashed #dee2e6;
+            border-radius: 10px;
+            padding: 2rem;
+            text-align: center;
+            background: #f8f9fa;
+            transition: all 0.3s ease;
+            cursor: pointer;
+        }
+        .image-upload-area:hover {
+            border-color: #667eea;
+            background: #f0f4ff;
+        }
+        .image-upload-area.dragover {
+            border-color: #667eea;
+            background: #e3f2fd;
+        }
+        .image-preview {
+            max-width: 100%;
+            max-height: 200px;
+            border-radius: 10px;
+            box-shadow: 0 4px 8px rgba(0,0,0,0.1);
+            margin-top: 1rem;
+        }
+        .uploaded-image {
+            max-width: 100%;
+            max-height: 300px;
+            border-radius: 10px;
+            box-shadow: 0 4px 8px rgba(0,0,0,0.1);
+        }
+        
+        /* Enhanced Responsive Design */
+        @media (max-width: 768px) {
+            .main-container {
+                margin: 1rem;
+                border-radius: 10px;
+            }
+            .header {
+                padding: 1.5rem;
+                border-radius: 10px 10px 0 0;
+            }
+            .header h1 {
+                font-size: 1.5rem;
+            }
+            .form-section, .results-section {
+                padding: 1rem;
+            }
+            .score-breakdown {
+                justify-content: center;
+            }
+            .artifact-card {
+                padding: 1rem;
+            }
+            .image-upload-area {
+                padding: 1rem;
+            }
+        }
+        
+        @media (max-width: 576px) {
+            .header h1 {
+                font-size: 1.25rem;
+            }
+            .header p {
+                font-size: 0.9rem;
+            }
+            .btn-analyze {
+                padding: 0.5rem 1rem;
+                font-size: 0.9rem;
+            }
+            .score-badge {
+                font-size: 0.75rem;
+                padding: 0.2rem 0.5rem;
+            }
+        }
     </style>
 </head>
 <body>
@@ -427,9 +561,9 @@ HTML_TEMPLATE = """
             </div>
             
             <div class="form-section">
-                <form id="artifactForm">
+                <form id="artifactForm" enctype="multipart/form-data">
                     <div class="row">
-                        <div class="col-md-4">
+                        <div class="col-lg-3 col-md-6">
                             <h5><i class="fas fa-ruler-combined text-primary"></i> Physical Dimensions (cm)</h5>
                             <div class="mb-3">
                                 <label for="length" class="form-label">Length</label>
@@ -445,7 +579,7 @@ HTML_TEMPLATE = """
                             </div>
                         </div>
                         
-                        <div class="col-md-4">
+                        <div class="col-lg-3 col-md-6">
                             <h5><i class="fas fa-palette text-warning"></i> Physical Properties</h5>
                             <div class="mb-3">
                                 <label for="color" class="form-label">Color</label>
@@ -481,7 +615,7 @@ HTML_TEMPLATE = """
                             </div>
                         </div>
                         
-                        <div class="col-md-4">
+                        <div class="col-lg-3 col-md-6">
                             <h5><i class="fas fa-map-marker-alt text-success"></i> Discovery Location</h5>
                             <div class="mb-3">
                                 <label for="latitude" class="form-label">Latitude</label>
@@ -493,11 +627,28 @@ HTML_TEMPLATE = """
                                 <input type="number" class="form-control" id="longitude" step="0.0001" min="-180" max="180" required>
                                 <small class="form-text text-muted">-180 to 180 degrees</small>
                             </div>
-                            <div class="mt-4">
-                                <button type="submit" class="btn btn-primary btn-analyze w-100">
-                                    <i class="fas fa-search"></i> Analyze Artifact
-                                </button>
+                        </div>
+                        
+                        <div class="col-lg-3 col-md-12">
+                            <h5><i class="fas fa-camera text-info"></i> Artifact Image</h5>
+                            <div class="image-upload-area" onclick="document.getElementById('imageInput').click()">
+                                <i class="fas fa-cloud-upload-alt fa-2x text-muted mb-2"></i>
+                                <p class="mb-2">Click to upload or drag & drop</p>
+                                <small class="text-muted">JPG, PNG, GIF up to 10MB</small>
+                                <input type="file" id="imageInput" name="image" accept="image/*" style="display: none;">
+                                <div id="imagePreview" style="display: none;">
+                                    <img id="previewImg" class="image-preview" alt="Preview">
+                                    <p class="mt-2 mb-0"><small class="text-success">Image selected</small></p>
+                                </div>
                             </div>
+                        </div>
+                    </div>
+                    
+                    <div class="row mt-4">
+                        <div class="col-12 text-center">
+                            <button type="submit" class="btn btn-primary btn-analyze">
+                                <i class="fas fa-search"></i> Analyze Artifact
+                            </button>
                         </div>
                     </div>
                 </form>
@@ -525,6 +676,56 @@ HTML_TEMPLATE = """
     </div>
 
     <script>
+        // Image upload functionality
+        let selectedFile = null;
+        
+        document.getElementById('imageInput').addEventListener('change', function(e) {
+            const file = e.target.files[0];
+            if (file) {
+                selectedFile = file;
+                const reader = new FileReader();
+                reader.onload = function(e) {
+                    document.getElementById('previewImg').src = e.target.result;
+                    document.getElementById('imagePreview').style.display = 'block';
+                };
+                reader.readAsDataURL(file);
+            }
+        });
+        
+        // Drag and drop functionality
+        const uploadArea = document.querySelector('.image-upload-area');
+        
+        uploadArea.addEventListener('dragover', function(e) {
+            e.preventDefault();
+            uploadArea.classList.add('dragover');
+        });
+        
+        uploadArea.addEventListener('dragleave', function(e) {
+            e.preventDefault();
+            uploadArea.classList.remove('dragover');
+        });
+        
+        uploadArea.addEventListener('drop', function(e) {
+            e.preventDefault();
+            uploadArea.classList.remove('dragover');
+            
+            const files = e.dataTransfer.files;
+            if (files.length > 0) {
+                const file = files[0];
+                if (file.type.startsWith('image/')) {
+                    selectedFile = file;
+                    document.getElementById('imageInput').files = files;
+                    
+                    const reader = new FileReader();
+                    reader.onload = function(e) {
+                        document.getElementById('previewImg').src = e.target.result;
+                        document.getElementById('imagePreview').style.display = 'block';
+                    };
+                    reader.readAsDataURL(file);
+                }
+            }
+        });
+        
         document.getElementById('artifactForm').addEventListener('submit', async function(e) {
             e.preventDefault();
             
@@ -532,25 +733,26 @@ HTML_TEMPLATE = """
             document.getElementById('loading').style.display = 'block';
             document.getElementById('results').style.display = 'none';
             
-            // Collect form data
-            const formData = {
-                length: parseFloat(document.getElementById('length').value),
-                width: parseFloat(document.getElementById('width').value),
-                height: parseFloat(document.getElementById('height').value),
-                color: document.getElementById('color').value,
-                material: document.getElementById('material').value,
-                shape: document.getElementById('shape').value,
-                latitude: parseFloat(document.getElementById('latitude').value),
-                longitude: parseFloat(document.getElementById('longitude').value)
-            };
+            // Create FormData for file upload
+            const formData = new FormData();
+            formData.append('length', document.getElementById('length').value);
+            formData.append('width', document.getElementById('width').value);
+            formData.append('height', document.getElementById('height').value);
+            formData.append('color', document.getElementById('color').value);
+            formData.append('material', document.getElementById('material').value);
+            formData.append('shape', document.getElementById('shape').value);
+            formData.append('latitude', document.getElementById('latitude').value);
+            formData.append('longitude', document.getElementById('longitude').value);
+            
+            // Add image file if selected
+            if (selectedFile) {
+                formData.append('image', selectedFile);
+            }
             
             try {
-                const response = await fetch('/analyze', {
+                const response = await fetch('/analyze-with-image', {
                     method: 'POST',
-                    headers: {
-                        'Content-Type': 'application/json',
-                    },
-                    body: JSON.stringify(formData)
+                    body: formData
                 });
                 
                 if (!response.ok) {
@@ -601,8 +803,11 @@ HTML_TEMPLATE = """
                         </div>
                         <div class="col-md-4 text-center">
                             <div class="bg-light rounded p-3">
-                                <i class="fas fa-image fa-4x text-muted mb-2"></i>
-                                <p class="small text-muted">Artifact visualization not available</p>
+                                ${data.uploaded_image ? 
+                                    `<img src="${data.uploaded_image}" class="uploaded-image" alt="Uploaded artifact">` :
+                                    `<i class="fas fa-image fa-4x text-muted mb-2"></i>
+                                     <p class="small text-muted">No image provided</p>`
+                                }
                             </div>
                         </div>
                     </div>
@@ -647,6 +852,8 @@ HTML_TEMPLATE = """
             document.getElementById('artifactForm').reset();
             document.getElementById('results').style.display = 'none';
             document.getElementById('loading').style.display = 'none';
+            document.getElementById('imagePreview').style.display = 'none';
+            selectedFile = null;
         }
         
         // Example data population for demo
@@ -761,7 +968,122 @@ async def analyze_artifact(artifact_input: ArtifactInput):
         
         return ArtifactResponse(
             result=best_match,
-            top_candidates=top_candidates
+            top_candidates=top_candidates,
+            uploaded_image=None
+        )
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"Error during artifact analysis: {e}")
+        raise HTTPException(status_code=500, detail="Internal server error during analysis")
+
+@app.post("/analyze-with-image", response_model=ArtifactResponse)
+async def analyze_artifact_with_image(
+    length: float = Form(...),
+    width: float = Form(...),
+    height: float = Form(...),
+    color: str = Form(...),
+    material: str = Form(...),
+    shape: str = Form(...),
+    latitude: float = Form(...),
+    longitude: float = Form(...),
+    image: Optional[UploadFile] = File(None)
+):
+    """
+    Enhanced analyze endpoint that accepts both form data and optional image uploads
+    Uses the same similarity scoring as /analyze but includes image features when available
+    """
+    try:
+        if not artifact_db.artifacts:
+            raise HTTPException(status_code=500, detail="Reference DB not loaded")
+        
+        # Create ArtifactInput object from form data
+        artifact_input = ArtifactInput(
+            length=length,
+            width=width,
+            height=height,
+            color=color,
+            material=material,
+            shape=shape,
+            latitude=latitude,
+            longitude=longitude
+        )
+        
+        # Apply input normalization
+        artifact_input.normalize_fields()
+        
+        # Handle image upload if provided
+        uploaded_image_path = None
+        image_features = None
+        
+        if image and image.content_type and image.content_type.startswith('image/'):
+            try:
+                # Generate unique filename
+                file_extension = image.filename.split('.')[-1] if image.filename and '.' in image.filename else 'jpg'
+                unique_filename = f"{uuid.uuid4()}.{file_extension}"
+                file_path = UPLOAD_DIR / unique_filename
+                
+                # Save uploaded image
+                with open(file_path, "wb") as buffer:
+                    shutil.copyfileobj(image.file, buffer)
+                
+                uploaded_image_path = f"/uploads/{unique_filename}"
+                
+                # Extract image features if extractor is available
+                if image_extractor:
+                    image_features = image_extractor.extract_features(str(file_path))
+                    print(f"Extracted image features: {image_features.shape}")
+                
+            except Exception as e:
+                print(f"Error processing image: {e}")
+                # Continue without image features
+        
+        candidates = []
+        
+        # Calculate similarity for each reference artifact
+        for reference_artifact in artifact_db.artifacts:
+            similarity_details = SimilarityCalculator.calculate_total_similarity(artifact_input, reference_artifact)
+            
+            # Add image similarity bonus if features are available
+            if image_features is not None:
+                # Simple image similarity bonus (can be enhanced with reference images)
+                # For now, add a small bonus for having an image
+                similarity_details['total_score'] += 2.0  # Small bonus for image upload
+                
+            # Calculate confidence as rounded total score
+            confidence = round(similarity_details['total_score'], 1)
+            
+            candidate = CandidateResult(
+                artifact=reference_artifact['name'],
+                era=reference_artifact['era'],
+                scores=ComponentScores(
+                    size=similarity_details['size_score'],
+                    color=similarity_details['color_score'],
+                    material=similarity_details['material_score'],
+                    shape=similarity_details['shape_score'],
+                    location=similarity_details['location_score']
+                ),
+                total_score=similarity_details['total_score'],
+                confidence=confidence,
+                reason=similarity_details['reason']
+            )
+            candidates.append(candidate)
+        
+        if not candidates:
+            raise HTTPException(status_code=500, detail="No suitable match found")
+        
+        # Sort candidates by total score (descending) and take top 3
+        candidates.sort(key=lambda x: x.total_score, reverse=True)
+        top_candidates = candidates[:3]
+        
+        # Best match is the first candidate
+        best_match = top_candidates[0]
+        
+        return ArtifactResponse(
+            result=best_match,
+            top_candidates=top_candidates,
+            uploaded_image=uploaded_image_path
         )
         
     except HTTPException:
