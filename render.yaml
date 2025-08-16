@@ -1,0 +1,6 @@
+services:
+  - type: web
+    name: artifact-client
+    env: python
+    buildCommand: pip install --upgrade pip setuptools wheel && pip install -r requirements.txt
+    startCommand: python main.py
